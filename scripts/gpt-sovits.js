@@ -3,7 +3,11 @@ import {
   saveSirenSettings,
   saveToCharacterCard,
 } from "./settings.js";
-import { generateGptSovitsAudio } from "./gptsovits_logic.js";
+import {
+  generateGptSovitsAudio,
+  detectGsvApiMode,
+  parseGsvApiV2List,
+} from "./gptsovits_logic.js";
 import { bindSirenSliders, syncTtsWorldbookEntries } from "./utils.js";
 
 // 统一下拉框和输入框的高度与盒模型，解决对齐问题
@@ -44,6 +48,31 @@ export function getGptSovitsHtml() {
                 <div class="siren-ext-setting-row siren-ext-flex-between" style="margin-bottom: 10px;">
                     <div class="siren-ext-setting-label">API Key</div>
                     <input type="password" id="siren-gsv-apikey" class="siren-ext-input" style="max-width: 60%;" placeholder="App Key">
+                </div>
+
+                <!-- [fork] 官方 api_v2 兼容 -->
+                <div class="siren-ext-setting-row siren-ext-flex-between" style="margin-bottom: 10px;">
+                    <div class="siren-ext-setting-label">
+                        <label>接口类型</label>
+                        <small style="display:block; color: #64748b;">官方整合包的 api_v2.py 选「官方 api_v2」</small>
+                    </div>
+                    <select id="siren-gsv-api-mode" class="siren-ext-select" style="max-width: 60%;">
+                        <option value="auto">自动识别</option>
+                        <option value="classic">原版 (infer_classic)</option>
+                        <option value="api_v2">官方 api_v2 (/tts)</option>
+                    </select>
+                </div>
+
+                <div id="siren-gsv-v2-box" style="margin-bottom: 10px;">
+                    <div class="siren-ext-setting-label" style="margin-bottom: 6px;">
+                        <label>api_v2 模型 / 参考音频路径</label>
+                        <small style="display:block; color: #64748b;">仅官方 api_v2 使用。每行一个服务器上的绝对路径：.ckpt 为 GPT，.pth 为 SoVITS，音频为参考音频（可写「路径|参考文本」）。填好后点刷新模型。</small>
+                    </div>
+                    <textarea id="siren-gsv-v2-list" class="siren-ext-textarea" rows="5" style="width: 100%; box-sizing: border-box; font-family: monospace; font-size: 0.85em; white-space: pre; overflow-x: auto;" placeholder="D:\\GPT-SoVITS\\GPT_weights_v2Pro\\xxx-e15.ckpt&#10;D:\\GPT-SoVITS\\SoVITS_weights_v2Pro\\xxx_e8_s200.pth&#10;D:\\refs\\normal.wav|参考音频里说的话"></textarea>
+                    <label style="display: flex; align-items: center; gap: 6px; margin-top: 6px; font-size: 0.85em; color: #cbd5e1; cursor: pointer;">
+                        <input type="checkbox" id="siren-gsv-v2-always-set">
+                        每句都重新加载权重（9880 同时被别的程序切换模型时勾选，会慢一点）
+                    </label>
                 </div>
 
                 <div class="siren-ext-setting-row siren-ext-flex-between">
@@ -330,9 +359,27 @@ export function bindGptSovitsEvents() {
   const settings = getSirenSettings();
   let pendingUploadFiles = [];
   let cachedAudioList = [];
+  // [fork] 当前面板选择的接口类型 ("api_v2" | "classic")
+  const getGsvUiMode = (force = false) =>
+    detectGsvApiMode(
+      $("#siren-gsv-api").val().trim().replace(/\/$/, ""),
+      $("#siren-gsv-api-mode").val() || "auto",
+      force,
+    );
   async function fetchCustomRefs() {
     const apiBase = $("#siren-gsv-api").val().trim().replace(/\/$/, "");
     if (!apiBase) return;
+
+    // [fork] api_v2 没有 /custom_refs：参考音频列表来自路径列表
+    if ((await getGsvUiMode()) === "api_v2") {
+      cachedAudioList = parseGsvApiV2List($("#siren-gsv-v2-list").val()).refs;
+      const $datalist = $("#siren-gsv-ref-list");
+      $datalist.empty();
+      cachedAudioList.forEach((filename) => {
+        $datalist.append(`<option value="${filename}">`);
+      });
+      return;
+    }
 
     try {
       // 调用你刚刚在 gsvi.py 里写的接口
@@ -371,6 +418,28 @@ export function bindGptSovitsEvents() {
     },
   );
 
+  // [fork] api_v2：从列表里选中参考音频时，若文本框为空则自动填入「路径|文本」里的文本
+  $("#siren-gptsovits-wrapper").on(
+    "change",
+    "input[list='siren-gsv-ref-list']",
+    function () {
+      const texts = parseGsvApiV2List($("#siren-gsv-v2-list").val()).refTexts;
+      const t = texts[$(this).val().trim()];
+      if (!t) return;
+      const cls = {
+        "siren-gsv-char-ref-path": ".siren-gsv-char-ref-text",
+        "siren-gsv-emo-ref-path": ".siren-gsv-emo-ref-text",
+        "siren-gsv-emo-model-ref-path": ".siren-gsv-emo-model-ref-text",
+      };
+      for (const k in cls) {
+        if ($(this).hasClass(k)) {
+          const $t = $(this).closest(".siren-gsv-row-item").find(cls[k]);
+          if (!$t.val()) $t.val(t);
+        }
+      }
+    },
+  );
+
   // --- 1. 测试连接 ---
   $("#siren-gsv-check-btn").on("click", async function () {
     const apiBase = $("#siren-gsv-api").val().trim().replace(/\/$/, "");
@@ -378,6 +447,15 @@ export function bindGptSovitsEvents() {
     $icon.removeClass("fa-link").addClass("fa-spinner fa-spin");
 
     try {
+      // [fork] 官方 api_v2 没有 /version
+      if ((await getGsvUiMode(true)) === "api_v2") {
+        const res = await fetch(`${apiBase}/openapi.json`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        if (window.toastr)
+          window.toastr.success("GSV 连接成功！接口: 官方 api_v2 (/tts)");
+        fetchCustomRefs();
+        return;
+      }
       const res = await fetch(`${apiBase}/version`, { method: "GET" });
       if (res.ok) {
         const data = await res.json();
@@ -413,8 +491,19 @@ export function bindGptSovitsEvents() {
     let allSovitsOptions = [];
 
     try {
+      // [fork] 官方 api_v2 没有模型列表接口：从路径列表生成，值为 "api_v2::完整路径"
+      const isV2 = (await getGsvUiMode(true)) === "api_v2";
+      if (isV2) {
+        const list = parseGsvApiV2List($("#siren-gsv-v2-list").val());
+        list.gpt.forEach((m) =>
+          allGptOptions.push({ label: `[api_v2] ${m}`, value: `api_v2::${m}` }),
+        );
+        list.sovits.forEach((m) =>
+          allSovitsOptions.push({ label: `[api_v2] ${m}`, value: `api_v2::${m}` }),
+        );
+      }
       // 采用顺次请求(for...of)，防止并发请求导致本地单线程后端阻塞或报错
-      for (const v of versions) {
+      for (const v of isV2 ? [] : versions) {
         try {
           const res = await fetch(`${apiBase}/classic_model_list/${v}`);
           if (!res.ok) continue; // 如果后端不支持该版本，直接跳过，不报错
@@ -458,7 +547,12 @@ export function bindGptSovitsEvents() {
 
       // 结果反馈
       if (allGptOptions.length === 0 && allSovitsOptions.length === 0) {
-        if (window.toastr)
+        if (isV2) {
+          if (window.toastr)
+            window.toastr.warning(
+              "官方 api_v2：请先在「api_v2 模型 / 参考音频路径」里填写 .ckpt / .pth 路径",
+            );
+        } else if (window.toastr)
           window.toastr.warning(
             "接口调用成功，但未能解析到模型。请按 F12 检查控制台数据！",
           );
@@ -538,6 +632,15 @@ export function bindGptSovitsEvents() {
     if (pendingUploadFiles.length === 0) return;
     const apiBase = $("#siren-gsv-api").val().trim().replace(/\/$/, "");
     const $btn = $(this);
+    // [fork] 官方 api_v2 不支持上传
+    if ((await getGsvUiMode()) === "api_v2") {
+      if (window.toastr)
+        window.toastr.warning(
+          "官方 api_v2 不支持上传，请把音频放到服务器上，再把绝对路径写进路径列表",
+        );
+      $("#siren-gsv-upload-cancel").click();
+      return;
+    }
     const originalHtml = $btn.html();
 
     $btn
@@ -736,6 +839,12 @@ export function bindGptSovitsEvents() {
     if (!settings.tts.gptsovits) settings.tts.gptsovits = {};
     settings.tts.gptsovits.api_base = $("#siren-gsv-api").val().trim();
     settings.tts.gptsovits.api_key = $("#siren-gsv-apikey").val().trim();
+    // [fork] 官方 api_v2 兼容
+    settings.tts.gptsovits.api_mode = $("#siren-gsv-api-mode").val() || "auto";
+    settings.tts.gptsovits.api_v2_list = $("#siren-gsv-v2-list").val();
+    settings.tts.gptsovits.api_v2_always_set_weights = $(
+      "#siren-gsv-v2-always-set",
+    ).is(":checked");
 
     // 全局高级参数
     settings.tts.gptsovits.text_split_method = $(
@@ -953,6 +1062,13 @@ function refreshGptSovitsData() {
       currentSettings.tts.gptsovits.api_base || "http://127.0.0.1:9880",
     );
     $("#siren-gsv-apikey").val(currentSettings.tts.gptsovits.api_key || "");
+    // [fork] 官方 api_v2 兼容
+    $("#siren-gsv-api-mode").val(currentSettings.tts.gptsovits.api_mode || "auto");
+    $("#siren-gsv-v2-list").val(currentSettings.tts.gptsovits.api_v2_list || "");
+    $("#siren-gsv-v2-always-set").prop(
+      "checked",
+      !!currentSettings.tts.gptsovits.api_v2_always_set_weights,
+    );
 
     // 渲染新增加的全局参数
     $("#siren-gsv-global-split").val(
